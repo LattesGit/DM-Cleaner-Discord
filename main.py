@@ -18,7 +18,7 @@ WHITELIST_CHANNELS = []
 WHITELIST_USERS = []
 DRY_RUN = True
 OLDER_THAN_DAYS = 0
-WORKERS = 3
+WORKERS = 18
 KEYWORD = ""
 KEEP_PINNED = False
 
@@ -26,7 +26,7 @@ KEEP_PINNED = False
 API = "https://discord.com/api/v10"
 DELETABLE_TYPES = {0, 19, 20, 23}
 DISCORD_EPOCH = 1420070400000
-MAX_RETRIES = 8
+MAX_RETRIES = 4
 TIMEOUT = 15
 LOG_FILE = "latent_clean_log.txt"
 FAILED_FILE = "latent_clean_failed.txt"
