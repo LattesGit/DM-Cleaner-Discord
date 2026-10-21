@@ -18,7 +18,7 @@ WHITELIST_CHANNELS = []
 WHITELIST_USERS = []
 DRY_RUN = True
 OLDER_THAN_DAYS = 0
-WORKERS = 8
+WORKERS = 2
 KEYWORD = ""
 KEEP_PINNED = False
 
@@ -26,12 +26,12 @@ KEEP_PINNED = False
 API = "https://discord.com/api/v10"
 DELETABLE_TYPES = {0, 19, 20, 23}
 DISCORD_EPOCH = 1420070400000
-MAX_RETRIES = 14
-TIMEOUT = 15
+MAX_RETRIES = 6
+TIMEOUT = 20
 LOG_FILE = "latent_clean_log.txt"
 FAILED_FILE = "latent_clean_failed.txt"
 CHECKPOINT_FILE = "latent_clean_checkpoint.json"
-CHECKPOINT_EVERY = 250
+CHECKPOINT_EVERY = 100
 
 CODES = {"reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m", "red": "\033[91m",
          "green": "\033[92m", "yellow": "\033[93m", "cyan": "\033[96m"}
@@ -125,23 +125,25 @@ def api(method, path, **kwargs):
         with lock:
             wait = max(global_until, bucket_until.get(key, 0.0)) - time.time()
         if wait > 0:
-            stop.wait(wait)
+            stop.wait(min(wait, 60))
             if stop.is_set():
                 return None
         try:
             response = session.request(method, API + path, timeout=TIMEOUT, **kwargs)
         except requests.RequestException:
-            stop.wait(min(2 * (attempt + 1), 10))
+            stop.wait(min(2 * (attempt + 1), 10) + random.uniform(0, 1))
             continue
 
         if response.status_code == 429:
             try:
                 data = response.json()
                 retry = float(data.get("retry_after", 2))
+                if retry > 100:
+                    retry = retry / 1000.0
                 is_global = bool(data.get("global", False))
             except (ValueError, TypeError):
                 retry, is_global = 2.0, False
-            until = time.time() + retry + 0.2
+            until = time.time() + retry + random.uniform(0.3, 1.0)
             with lock:
                 stats["rate_limits"] += 1
                 if is_global:
@@ -156,15 +158,14 @@ def api(method, path, **kwargs):
             return None
 
         if response.status_code >= 500:
-            stop.wait(min(2 * (attempt + 1), 10))
+            stop.wait(min(2 * (attempt + 1), 10) + random.uniform(0, 1))
             continue
-
 
         if response.headers.get("X-RateLimit-Remaining") == "0":
             try:
                 reset = float(response.headers.get("X-RateLimit-Reset-After", 0))
                 with lock:
-                    bucket_until[key] = max(bucket_until.get(key, 0.0), time.time() + reset + 0.05)
+                    bucket_until[key] = max(bucket_until.get(key, 0.0), time.time() + reset + 0.1)
             except ValueError:
                 pass
         return response
@@ -265,7 +266,7 @@ def fetch_own_messages(channel_id):
         before = batch[-1]["id"]
         if len(batch) < 100:
             break
-        stop.wait(random.uniform(0.05, 0.2))
+        stop.wait(random.uniform(0.4, 0.8))
     with io_lock:
         sys.stdout.write("\r" + " " * 60 + "\r")
         sys.stdout.flush()
@@ -275,13 +276,15 @@ def fetch_own_messages(channel_id):
 def delete_message(channel_id, message_id):
     response = api("DELETE", f"/channels/{channel_id}/messages/{message_id}")
     if response is None:
-        return "stopped" if stop.is_set() else "retries"
+        return "retries"
     if response.status_code in (200, 204):
         return "deleted"
     if response.status_code == 404:
         return "gone"
     if response.status_code == 403:
         return "forbidden"
+    if response.status_code == 429:
+        return "retries"
     return f"http_{response.status_code}"
 
 
@@ -312,9 +315,10 @@ def progress(done, total, ok, bad, started, skipped=0):
 
 
 def run_deletes(items):
-    ok = bad = skip = 0
+    ok = bad = skip = retries = 0
     total = len(items)
     started = time.time()
+    retry_list = []
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=cfg.workers)
     futures = {pool.submit(delete_message, c, m): (c, m) for c, m in items}
     try:
@@ -330,8 +334,9 @@ def run_deletes(items):
             elif status == "forbidden":
                 skip += 1
                 bump("skipped")
-            elif status == "stopped":
-                pass
+            elif status == "retries":
+                retries += 1
+                retry_list.append((channel_id, message_id))
             else:
                 bad += 1
                 with lock:
@@ -346,6 +351,13 @@ def run_deletes(items):
     finally:
         pool.shutdown(wait=True, cancel_futures=True)
     print()
+    if retry_list and not stop.is_set():
+        log(f"retrying {len(retry_list)} messages (rate limited)", "warn")
+        time.sleep(3)
+        ok2, bad2, skip2 = run_deletes(retry_list)
+        ok += ok2
+        bad += bad2
+        skip += skip2
     return ok, bad, skip
 
 
@@ -506,9 +518,9 @@ def settings_menu():
             value = ask("Delete only messages older than how many days? ")
             cfg.days = int(value) if value.isdigit() else 0
         elif choice == "3":
-            value = ask("Threads (1-10): ")
+            value = ask("Threads (1-3): ")
             if value.isdigit():
-                cfg.workers = max(1, min(10, int(value)))
+                cfg.workers = max(1, min(3, int(value)))
         elif choice == "4":
             cfg.keyword = ask("Keyword (empty = off): ")
         elif choice == "5":
@@ -578,7 +590,7 @@ def parse_args():
     p.add_argument("--older-than", type=int, metavar="DAYS", help="only messages older than N days")
     p.add_argument("--keyword", metavar="TEXT", help="only messages containing TEXT")
     p.add_argument("--keep-pinned", action="store_true", help="never delete pinned messages")
-    p.add_argument("-w", "--workers", type=int, metavar="N", help="delete workers (1-10)")
+    p.add_argument("-w", "--workers", type=int, metavar="N", help="delete workers (1-3)")
     p.add_argument("--skip-channel", nargs="+", default=[], metavar="ID", help="channel IDs to skip")
     p.add_argument("--skip-user", nargs="+", default=[], metavar="ID", help="skip DMs with these user IDs")
     p.add_argument("--resume", action="store_true", help="resume from the last checkpoint")
@@ -596,7 +608,7 @@ def apply_args(args):
     if args.keep_pinned:
         cfg.keep_pinned = True
     if args.workers:
-        cfg.workers = max(1, min(10, args.workers))
+        cfg.workers = max(1, min(3, args.workers))
     cfg.wl_channels.update(str(x) for x in args.skip_channel)
     cfg.wl_users.update(str(x) for x in args.skip_user)
     cfg.yes = args.yes
@@ -620,7 +632,7 @@ def main():
     session.headers.update({
         "Authorization": token,
         "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     })
 
     response = api("GET", "/users/@me")
